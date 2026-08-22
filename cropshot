@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Select a region of the screen and save it, or take the whole screen.
+
+Live is the default: slurp on the screen as it is, then grim captures just
+that region. Nothing else is ever captured.
+
+--freeze is for what dies when focus moves - menus, hovers, tooltips. There
+the whole screen is grabbed first and shown back fullscreen, and the region is
+drawn over that still, so the thing cannot vanish mid-selection. Only the crop
+leaves this script: the full frame lives in /dev/shm and is removed however
+the script exits.
+
+--screen skips the selection entirely and takes every output.
+
+--delay lands in the place that is useful to each: before the grab when
+frozen, and after the selection when live, so a region can be picked and then
+filled with whatever needed a click to appear.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+
+from PIL import Image
+
+# imv is native Wayland and fullscreens on its own. feh asks through XWayland
+# and sway 1.9 ignores the request, leaving the still tiled inside the gaps
+# with the selection landing somewhere else entirely - so it is the fallback,
+# and every viewer is fullscreened by sway and checked below regardless.
+VIEWERS = [
+    ["imv-wayland", "-f"],
+    ["imv", "-f"],
+    ["feh", "--fullscreen", "--hide-pointer", "--image-bg", "black"],
+]
+
+FILENAME = "screenshot_%F-%H_%M_%S.png"
+
+
+def require(command, why):
+    if not shutil.which(command):
+        sys.exit(f"cropshot: {command} is not installed - {why}")
+
+
+def swaymsg(*args, msg_type=None):
+    cmd = ["swaymsg", "-r"]
+    if msg_type:
+        cmd += ["-t", msg_type]
+    cmd += list(args)
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    return json.loads(out) if out.strip() else None
+
+
+def walk(node):
+    yield node
+    for child in node.get("nodes", []) + node.get("floating_nodes", []):
+        yield from walk(child)
+
+
+def window_rect(pid):
+    tree = swaymsg(msg_type="get_tree")
+    for node in walk(tree):
+        if node.get("pid") == pid:
+            return node["rect"]
+    return None
+
+
+def default_directory():
+    """$XDG_SCREENSHOTS_DIR, however it was set, falling back to $HOME.
+
+    It is not one of the keys xdg-user-dirs manages, so it can arrive either as
+    an exported variable or as a line in user-dirs.dirs beside the standard
+    ones - and setting it there is the more natural of the two.
+    """
+    directory = os.environ.get("XDG_SCREENSHOTS_DIR")
+    if not directory:
+        config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        try:
+            for line in (config / "user-dirs.dirs").read_text().splitlines():
+                name, _, value = line.partition("=")
+                if name.strip() == "XDG_SCREENSHOTS_DIR":
+                    directory = value.strip().strip('"')
+                    break
+        except OSError:
+            pass
+    return Path(os.path.expandvars(directory)) if directory else Path.home()
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="cropshot",
+        usage="cropshot [--freeze] [--screen] [--cursor] [--delay SECONDS]\n"
+              "                [--clipboard] [--directory DIR] [FILE]",
+        description="A screenshot utility for Wayland displays.\n\n"
+                    "Freezing captures the screen first, so you crop a still that\n"
+                    "cannot change. Selecting takes the pointer and the keyboard\n"
+                    "away from whatever you were pointing at, and much of what is\n"
+                    "worth capturing exists only while it holds them.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="With no FILE, the capture is named for the time it was taken and\n"
+               "saved to $XDG_SCREENSHOTS_DIR, set in the environment or in\n"
+               "user-dirs.dirs, or to $HOME when neither sets it.\n"
+               "\n"
+               "Delay:\n"
+               "  Cropping             select, wait, capture\n"
+               "  Cropping frozen      wait, capture, select\n"
+               "  Whole screen         wait, capture\n"
+               "\n"
+               "Requires:\n"
+               "  grim               every capture\n"
+               "  Pillow             every capture\n"
+               "  slurp              selecting a region\n"
+               "  wl-clipboard       --clipboard\n"
+               "  sway, imv or feh   --freeze",
+    )
+    parser._optionals.title = "Options"
+
+    capture = parser.add_argument_group("Capture")
+    capture.add_argument("-f", "--freeze", action="store_true",
+                         help="select from a still image of the screen")
+    capture.add_argument("-s", "--screen", action="store_true",
+                         help="capture every output, with nothing to select")
+    capture.add_argument("--cursor", action="store_true",
+                         help="include the mouse pointer")
+    capture.add_argument("-d", "--delay", type=float, default=0, metavar="SECONDS",
+                         help="wait this long before capturing")
+
+    destination = parser.add_argument_group("Destination")
+    destination.add_argument("file", nargs="?", metavar="FILE",
+                             help="save the capture here as PNG; - is stdout")
+    destination.add_argument("--directory", type=Path, default=default_directory(),
+                             metavar="DIR",
+                             help="where captures go when no FILE is named")
+    destination.add_argument("-c", "--clipboard", action="store_true",
+                             help="copy to the clipboard; with a FILE, save it as well")
+    args = parser.parse_args(argv)
+    if args.screen and args.freeze:
+        parser.error("--screen takes the whole screen, so there is nothing to freeze for")
+    return args
+
+
+def freeze(frame):
+    """Show the still fullscreen and return the viewer, once sway confirms it covers an output."""
+    for viewer in VIEWERS:
+        if shutil.which(viewer[0]):
+            break
+    else:
+        sys.exit("cropshot: no viewer found - install imv (apt install imv) or feh")
+
+    # Freezing is the one part that is sway's rather than wlroots': the viewer
+    # is fullscreened and checked through the tree, because asking it nicely is
+    # what left the still tiled in the first place.
+    require("swaymsg", "--freeze needs sway; the default live selection does not")
+
+    process = subprocess.Popen(viewer + [str(frame)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    output_rects = [output["rect"] for output in swaymsg(msg_type="get_outputs")]
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        swaymsg(f"[pid={process.pid}] fullscreen enable, border none")
+        if window_rect(process.pid) in output_rects:
+            return process
+        time.sleep(0.05)
+
+    process.terminate()
+    sys.exit("cropshot: the still is not covering the screen, so the crop would come "
+             "out of the wrong place")
+
+
+def select():
+    """Ask slurp for a region, in logical coordinates. None if it was cancelled."""
+    result = subprocess.run(["slurp", "-d"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    position, size = result.stdout.split()
+    x, y = (int(n) for n in position.split(","))
+    width, height = (int(n) for n in size.split("x"))
+    return x, y, width, height
+
+
+def grim(args, *extra):
+    """Run grim to stdout, with the cursor if it was asked for."""
+    result = subprocess.run(["grim", *(["-c"] if args.cursor else []), *extra, "-"],
+                            capture_output=True)
+    if result.returncode != 0:
+        sys.exit(f"cropshot: grim failed - {result.stderr.decode().strip()}")
+    return Image.open(BytesIO(result.stdout))
+
+
+def capture_screen(args):
+    """Every output, no selection - the one mode that asks nothing of the user."""
+    if args.delay:
+        time.sleep(args.delay)
+    return grim(args)
+
+
+def capture_live(args):
+    """Select on the live screen, then let grim capture only that region."""
+    region = select()
+    if region is None:
+        return None
+    if args.delay:
+        time.sleep(args.delay)
+    x, y, width, height = region
+    return grim(args, "-g", f"{x},{y} {width}x{height}")
+
+
+def capture_frozen(args, frame_path, hold):
+    """Grab the whole screen, show it back fullscreen, and crop what is drawn on it."""
+    if args.delay:
+        time.sleep(args.delay)
+    grim(args).save(frame_path)
+
+    viewer = hold(freeze(frame_path))
+    region = select()
+    viewer.terminate()
+    viewer.wait(timeout=2)
+    if region is None:
+        return None
+    with Image.open(frame_path) as frame:
+        return frame.crop(to_pixels(region, frame))
+
+
+def to_pixels(region, frame):
+    """slurp works in logical coordinates; grim writes device pixels.
+
+    grim composes every output into one image at the largest scale in use, so
+    the two differ by a single factor even on a mixed-scale desktop - but the
+    logical origin can be negative, and that offset has to come out first.
+    """
+    rects = [output["rect"] for output in swaymsg(msg_type="get_outputs")]
+    left = min(rect["x"] for rect in rects)
+    top = min(rect["y"] for rect in rects)
+    logical_width = max(rect["x"] + rect["width"] for rect in rects) - left
+    scale = frame.width / logical_width
+
+    x, y, width, height = region
+    x, y = round((x - left) * scale), round((y - top) * scale)
+    width, height = round(width * scale), round(height * scale)
+    return x, y, x + width, y + height
+
+
+def deliver(crop, args):
+    if args.clipboard:
+        # wl-copy holds the image in a process of its own, so the crop outlives
+        # this script but not the session - the whole difference between the
+        # two destinations. Never reached without being asked for: a clipboard
+        # holds someone's work, and overwriting it silently loses it.
+        subprocess.run(["wl-copy", "-t", "image/png"], input=crop_bytes(crop), check=True)
+
+    # --clipboard on its own means the clipboard is where the crop was wanted;
+    # naming a file asks for both.
+    if args.clipboard and not args.file:
+        print(f"copied {crop.width}x{crop.height} to the clipboard", file=sys.stderr)
+        return
+
+    if args.file == "-":
+        sys.stdout.buffer.write(crop_bytes(crop))
+        return
+
+    if args.file:
+        path = Path(args.file).expanduser()
+    else:
+        args.directory.expanduser().mkdir(parents=True, exist_ok=True)
+        path = args.directory.expanduser() / datetime.now().strftime(FILENAME)
+    crop.save(path)
+    print(path)
+
+
+def crop_bytes(crop):
+    from io import BytesIO
+    buffer = BytesIO()
+    crop.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def main(argv):
+    args = parse_args(argv)
+    require("grim", "it is what takes the picture")
+    if not args.screen:
+        require("slurp", "it is what selects the region")
+    if args.clipboard:
+        require("wl-copy", "it is what holds the crop for pasting (package wl-clipboard)")
+
+    frame_path = None
+    if args.freeze:
+        handle, name = tempfile.mkstemp(prefix="cropshot.", suffix=".png", dir="/dev/shm")
+        os.close(handle)
+        frame_path = Path(name)
+    viewer = None
+
+    def clean(*_):
+        if viewer and viewer.poll() is None:
+            viewer.terminate()
+        if frame_path:
+            frame_path.unlink(missing_ok=True)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (clean(), sys.exit(130)))
+
+    def hold(process):
+        nonlocal viewer
+        viewer = process
+        return process
+
+    try:
+        if args.screen:
+            crop = capture_screen(args)
+        elif args.freeze:
+            crop = capture_frozen(args, frame_path, hold)
+        else:
+            crop = capture_live(args)
+        if crop is None:
+            return 1
+        deliver(crop, args)
+    finally:
+        clean()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
