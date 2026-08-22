@@ -7,6 +7,16 @@ Selecting takes the pointer and the keyboard away from whatever you were
 pointing at, and much of what is worth capturing exists only while it holds
 them.
 
+## Install
+
+```bash
+sudo make install
+```
+
+Needs Python 3 and Pillow (`python3-pil` on Debian and Ubuntu, `pip install
+Pillow` otherwise). `grim` and `slurp` come from the same package names on
+every distribution that ships them.
+
 ## Examples
 
 ```
