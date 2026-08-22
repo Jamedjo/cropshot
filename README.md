@@ -74,3 +74,9 @@ coordinates looks exactly like a successful screenshot.
 
 The full frame lives in `/dev/shm` and is removed on every exit path, including
 a cancelled selection. Only the crop is written anywhere.
+
+## Licence
+
+[NICE Licence](LICENSE) (NICE Is Copycentral Enforced) — MIT-style permissive, with one extra condition:
+this code may never be placed under copyleft terms. Use it anywhere, commercially or otherwise, except in
+works whose licence would require this code's source to be made available.
