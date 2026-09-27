@@ -32,13 +32,15 @@ from pathlib import Path
 
 from PIL import Image
 
-# imv is native Wayland and fullscreens on its own. feh asks through XWayland
-# and sway 1.9 ignores the request, leaving the still tiled inside the gaps
-# with the selection landing somewhere else entirely - so it is the fallback,
-# and every viewer is fullscreened by sway and checked below regardless.
+# imv is not asked to fullscreen itself, only by sway below: a workspace grants
+# one fullscreen container, so a still that requests it takes it off whatever
+# window had it, and the app pops its own 'how to exit fullscreen' overlay when
+# it gets it back. feh is the fallback because it asks through XWayland, which
+# sway 1.9 ignores - leaving the still tiled inside the gaps with the selection
+# landing somewhere else entirely. Its --fullscreen is what scales the image.
 VIEWERS = [
-    ["imv-wayland", "-f"],
-    ["imv", "-f"],
+    ["imv-wayland"],
+    ["imv"],
     ["feh", "--fullscreen", "--hide-pointer", "--image-bg", "black"],
 ]
 
@@ -157,7 +159,8 @@ def freeze(frame):
 
     # Freezing is the one part that is sway's rather than wlroots': the viewer
     # is fullscreened and checked through the tree, because asking it nicely is
-    # what left the still tiled in the first place.
+    # what left the still tiled in the first place. Global fullscreen, which is
+    # the kind that covers the output without taking a fullscreen window's own.
     require("swaymsg", "--freeze needs sway; the default live selection does not")
 
     process = subprocess.Popen(viewer + [str(frame)],
@@ -165,7 +168,7 @@ def freeze(frame):
     output_rects = [output["rect"] for output in swaymsg(msg_type="get_outputs")]
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        swaymsg(f"[pid={process.pid}] fullscreen enable, border none")
+        swaymsg(f"[pid={process.pid}] fullscreen enable global, border none")
         if window_rect(process.pid) in output_rects:
             return process
         time.sleep(0.05)
