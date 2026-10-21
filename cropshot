@@ -202,9 +202,13 @@ def select():
     return x, y, width, height
 
 
-def grim(args, *extra):
-    """Run grim to stdout, with the cursor if it was asked for."""
-    result = subprocess.run(["grim", *(["-c"] if args.cursor else []), *extra, "-"],
+def grim(*extra, cursor=False):
+    """Run grim to stdout, with the cursor if it was asked for.
+
+    PPM is uncompressed: grim takes over a second to compress a multi-screen
+    PNG, and only the final crop needs compressing.
+    """
+    result = subprocess.run(["grim", "-t", "ppm", *(["-c"] if cursor else []), *extra, "-"],
                             capture_output=True)
     if result.returncode != 0:
         sys.exit(f"cropshot: grim failed - {result.stderr.decode().strip()}")
@@ -215,7 +219,7 @@ def capture_screen(args):
     """Every output, no selection - the one mode that asks nothing of the user."""
     if args.delay:
         time.sleep(args.delay)
-    return grim(args)
+    return grim(cursor=args.cursor)
 
 
 def capture_live(args):
@@ -226,14 +230,17 @@ def capture_live(args):
     if args.delay:
         time.sleep(args.delay)
     x, y, width, height = region
-    return grim(args, "-g", f"{x},{y} {width}x{height}")
+    return grim("-g", f"{x},{y} {width}x{height}", cursor=args.cursor)
 
 
 def capture_frozen(args, frame_path, hold):
     """Grab the whole screen, show it back fullscreen, and crop what is drawn on it."""
     if args.delay:
         time.sleep(args.delay)
-    grim(args).save(frame_path)
+    frame = grim(cursor=args.cursor)
+    # Uncompressed TIFF: written in a tenth of a second, and imv draws it as
+    # fast as a PNG. imv reads PPM through FreeImage, which is slower.
+    frame.save(frame_path)
 
     viewer = hold(freeze(frame_path))
     region = select()
@@ -241,8 +248,7 @@ def capture_frozen(args, frame_path, hold):
     viewer.wait(timeout=2)
     if region is None:
         return None
-    with Image.open(frame_path) as frame:
-        return frame.crop(to_pixels(region, frame))
+    return frame.crop(to_pixels(region, frame))
 
 
 def to_pixels(region, frame):
@@ -305,7 +311,7 @@ def main(argv):
 
     frame_path = None
     if args.freeze:
-        handle, name = tempfile.mkstemp(prefix="cropshot.", suffix=".png", dir="/dev/shm")
+        handle, name = tempfile.mkstemp(prefix="cropshot.", suffix=".tiff", dir="/dev/shm")
         os.close(handle)
         frame_path = Path(name)
     viewer = None
