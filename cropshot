@@ -30,7 +30,7 @@ from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 # imv is not asked to fullscreen itself, only by sway below: a workspace grants
 # one fullscreen container, so a still that requests it takes it off whatever
@@ -243,12 +243,32 @@ def capture_frozen(args, frame_path, hold):
     frame.save(frame_path)
 
     viewer = hold(freeze(frame_path))
+    wait_until_shown(frame)
     region = select()
     viewer.terminate()
     viewer.wait(timeout=2)
     if region is None:
         return None
     return frame.crop(to_pixels(region, frame))
+
+
+def wait_until_shown(frame):
+    """Wait for the viewer to draw the still, so slurp does not dim an empty window.
+
+    sway sizes the window before imv has decoded the image. Until then the
+    window is imv's black background, which slurp's overlay turns grey.
+    """
+    output = next(output["rect"] for output in swaymsg(msg_type="get_outputs")
+                  if output.get("active", True))
+    region = (output["x"], output["y"], output["width"], output["height"])
+    expected = frame.crop(to_pixels(region, frame)).convert("RGB").reduce(4)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        screen = grim("-g", "{},{} {}x{}".format(*region)).convert("RGB").reduce(4)
+        if screen.size == expected.size and \
+                max(ImageStat.Stat(ImageChops.difference(screen, expected)).mean) < 4:
+            return
+        time.sleep(0.05)
 
 
 def to_pixels(region, frame):
